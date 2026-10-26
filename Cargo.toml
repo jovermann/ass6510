@@ -1,0 +1,8 @@
+[package]
+name = "ass6510"
+version = "0.0.1"
+edition = "2021"
+license = "BSL-1.0"
+description = "A simple 6510 assembler"
+
+[dependencies]
