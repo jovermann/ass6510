@@ -32,9 +32,23 @@ start   LDA #$01
         END
 ```
 
-Supported directives are `ASS`, `END`, `BYT`, `ADR`, `DSB`, `DSA`, `EQU` (or `=`), `SET`, `ORG`, `ALG`, `BEC`, and `ENC`. `ORG` and `ALG` fill gaps with NOP (`$EA`); `DSB` and `DSA` fill with zero bytes. Local labels start with `.` and are scoped until the next global label. Forward references are patched when symbols are defined. A forward address uses an absolute instruction; a known address below `$100` can use zero-page encoding. Writing an address as four hex digits, such as `$0001`, forces absolute encoding.
+Supported directives are `ASS`, `END`, `INCLUDE`, `BYT`, `ADR`, `DSB`, `DSA`, `EQU` (or `=`), `SET`, `ORG`, `ALG`, `BEC`, and `ENC`. `ORG` and `ALG` fill gaps with NOP (`$EA`); `DSB` and `DSA` fill with zero bytes. Local labels start with `.` and are scoped until the next global label. Forward references are patched when symbols are defined. A forward address uses an absolute instruction; a known address below `$100` can use zero-page encoding. Writing an address as four hex digits, such as `$0001`, forces absolute encoding.
 
-Numbers can be decimal (`10`), hex (`$0A`), octal (`&12` or `$$12`), binary (`%1010`), base four (`=22`), or a character (`'A` or `'A'`). Character immediates include punctuation, for example `LDA #'"'`. Expressions support unary `+`, `-`, `~` and binary `+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `<`, `>`. For compatibility with the old implementation, binary expressions are **right associative** and have no precedence: `10-3-2` evaluates to `9`.
+`INCLUDE "file.asm"` inserts another source file at that line. Paths are relative to the file containing the directive, nested includes are supported up to 32 files, and labels and the program counter continue across file boundaries. Include files normally omit their own `ASS` and `END`; if present, those directives have the same effect as if written in the parent file. Recursive include cycles are errors.
+
+```asm
+        ASS $1000
+        INCLUDE "sprites/characters.asm"
+        END
+```
+
+Numbers can be decimal (`10`), hex (`$0A` or `0xaa`), octal (`&12` or `$$12`), binary (`%1010` or `0b1010`), base four (`=22`), or a character (`'A` or `'A'`). For character ROMs, `BYT 0b00111100,0b01000010,0b10000001` inserts three bytes. Character immediates include punctuation, for example `LDA #'"'`. Expressions support unary `+`, `-`, `~` and binary `+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `<`, `>`. For compatibility with the old implementation, binary expressions are **right associative** and have no precedence: `10-3-2` evaluates to `9`.
+
+Visual binary literals use `.` for zero and `#` for one, with exactly eight positions per byte:
+
+```asm
+        BYT %"..###...",%"#......#",%"########"
+```
 
 ## Inspect and convert object code
 

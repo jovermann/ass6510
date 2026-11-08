@@ -2,7 +2,7 @@
 // Distributed under the Boost Software License, Version 1.0.
 // See LICENSE for details.
 
-use ass6510::{assemble, disassemble, hexdump, opcode_list, Assembly};
+use ass6510::{assemble_file, disassemble, hexdump, opcode_list, Assembly, Diagnostic};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -243,10 +243,22 @@ fn symbol_listing(assembly: &Assembly) -> String {
     for (name, symbol) in &assembly.symbols {
         let unsigned = symbol.value as u16;
         let signed = unsigned as i16;
-        out.push_str(&format!("{name:width$} = ${unsigned:04X} == {unsigned:5} == {signed:6} defined on line {:5} {}\n",
-            symbol.line, if symbol.used { "" } else { "(unused)" }));
+        let location = symbol.file.as_ref().map_or_else(
+            || format!("line {}", symbol.line),
+            |file| format!("{}:{}", file.display(), symbol.line),
+        );
+        out.push_str(&format!("{name:width$} = ${unsigned:04X} == {unsigned:5} == {signed:6} defined at {location} {}\n",
+            if symbol.used { "" } else { "(unused)" }));
     }
     out
+}
+
+/// Format a source diagnostic with its original file and line.
+fn diagnostic_location(diagnostic: &Diagnostic) -> String {
+    diagnostic.file.as_ref().map_or_else(
+        || format!("line {}", diagnostic.line),
+        |file| format!("{}:{}", file.display(), diagnostic.line),
+    )
 }
 
 /// Execute the selected assembler or object-code operation.
@@ -261,9 +273,7 @@ fn run(options: Options) -> Result<(), String> {
     }
     match options.action {
         Action::Assemble => {
-            let source = fs::read_to_string(input)
-                .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
-            let assembly = match assemble(&source) {
+            let assembly = match assemble_file(input) {
                 Ok(assembly) => assembly,
                 Err(errors) => {
                     let count = if options.stop_on_errors {
@@ -272,14 +282,22 @@ fn run(options: Options) -> Result<(), String> {
                         usize::MAX
                     };
                     for diagnostic in errors.iter().take(count) {
-                        eprintln!("error (line {}): {}", diagnostic.line, diagnostic.message);
+                        eprintln!(
+                            "error ({}): {}",
+                            diagnostic_location(diagnostic),
+                            diagnostic.message
+                        );
                     }
                     return Err(format!("assembly failed with {} error(s)", errors.len()));
                 }
             };
             if options.warnings {
                 for diagnostic in &assembly.warnings {
-                    eprintln!("warning (line {}): {}", diagnostic.line, diagnostic.message);
+                    eprintln!(
+                        "warning ({}): {}",
+                        diagnostic_location(diagnostic),
+                        diagnostic.message
+                    );
                 }
             }
             let output = options

@@ -3,6 +3,8 @@
 // See LICENSE for details.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// The largest object file the assembler can create.
 pub const MAX_BYTES: usize = 65_536;
@@ -10,6 +12,8 @@ pub const MAX_BYTES: usize = 65_536;
 /// A source diagnostic with its physical line number.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
+    /// File containing the source line, when assembled from disk.
+    pub file: Option<PathBuf>,
     /// The one-based source line.
     pub line: usize,
     /// The diagnostic text.
@@ -19,6 +23,8 @@ pub struct Diagnostic {
 /// A symbol retained in the final symbol table.
 #[derive(Clone, Debug)]
 pub struct Symbol {
+    /// File containing the definition, when assembled from disk.
+    pub file: Option<PathBuf>,
     /// The symbol value.
     pub value: i64,
     /// The source line that last defined it.
@@ -126,6 +132,7 @@ impl Assembler {
     /// Record a source error without losing later diagnostics.
     fn error(&mut self, message: impl Into<String>) {
         self.errors.push(Diagnostic {
+            file: None,
             line: self.line,
             message: message.into(),
         });
@@ -134,6 +141,7 @@ impl Assembler {
     /// Record a source warning.
     fn warning(&mut self, message: impl Into<String>) {
         self.warnings.push(Diagnostic {
+            file: None,
             line: self.line,
             message: message.into(),
         });
@@ -181,6 +189,7 @@ impl Assembler {
         self.symbols.insert(
             name.to_owned(),
             Symbol {
+                file: None,
                 value,
                 line: self.line,
                 used: false,
@@ -198,6 +207,7 @@ impl Assembler {
         for fixup in std::mem::take(&mut self.fixups) {
             if expression_has_local(&fixup.expression) {
                 self.errors.push(Diagnostic {
+                    file: None,
                     line: fixup.line,
                     message: format!("undefined local symbol in '{}'", fixup.expression),
                 });
@@ -214,11 +224,15 @@ impl Assembler {
         let pending = std::mem::take(&mut self.fixups);
         for fixup in pending {
             let errors_before = self.errors.len();
+            let current_line = self.line;
+            self.line = fixup.line;
             let value = self.evaluate(&fixup.expression);
+            self.line = current_line;
             if let Some(value) = value {
                 self.patch(&fixup, value);
             } else if final_pass && self.errors.len() == errors_before {
                 self.errors.push(Diagnostic {
+                    file: None,
                     line: fixup.line,
                     message: format!("undefined symbol in expression '{}'", fixup.expression),
                 });
@@ -238,6 +252,7 @@ impl Assembler {
         let (min, max) = limits(fixup.kind);
         if !(min..=max).contains(&encoded) {
             self.errors.push(Diagnostic {
+                file: None,
                 line: fixup.line,
                 message: format!("value out of range [{min}..{max}] (was {encoded})"),
             });
@@ -494,6 +509,7 @@ pub fn assemble(source: &str) -> Result<Assembly, Vec<Diagnostic>> {
             }
             "" => {}
             "ASS" => assembler.error("ASS is allowed only once at the beginning"),
+            "INCLUDE" => assembler.error("INCLUDE requires assemble_file"),
             "BEC" => comment_depth = 1,
             "BYT" | "ADR" | "DSB" | "DSA" | "ORG" | "ALG" | "ENC" => {
                 assembler.directive(&line.opcode, line.operand)
@@ -524,6 +540,153 @@ pub fn assemble(source: &str) -> Result<Assembly, Vec<Diagnostic>> {
     })
 }
 
+/// The original location of a line in expanded source.
+#[derive(Clone)]
+struct SourceLocation {
+    /// Canonical source file path.
+    file: PathBuf,
+    /// One-based line number in that file.
+    line: usize,
+}
+
+/// Source text and the location of each expanded line.
+#[derive(Default)]
+struct ExpandedSource {
+    /// Source after INCLUDE lines have been replaced with file contents.
+    text: String,
+    /// Location corresponding to each line of `text`.
+    locations: Vec<SourceLocation>,
+    /// Whether an ASS directive has been seen in the expanded stream.
+    started: bool,
+    /// Whether END has stopped assembly of the expanded stream.
+    ended: bool,
+    /// Current BEC/ENC nesting depth after ASS.
+    comment_depth: usize,
+}
+
+/// Assemble a file, expanding INCLUDE directives before parsing instructions.
+pub fn assemble_file(path: &Path) -> Result<Assembly, Vec<Diagnostic>> {
+    let mut expanded = ExpandedSource::default();
+    let origin = SourceLocation {
+        file: path.to_path_buf(),
+        line: 0,
+    };
+    expand_file(path, &origin, &mut Vec::new(), &mut expanded).map_err(|error| vec![error])?;
+    let mut assembly = assemble(&expanded.text).map_err(|mut errors| {
+        for error in &mut errors {
+            map_location(error, &expanded.locations, path);
+        }
+        errors
+    })?;
+    for warning in &mut assembly.warnings {
+        map_location(warning, &expanded.locations, path);
+    }
+    for symbol in assembly.symbols.values_mut() {
+        if let Some(location) = expanded.locations.get(symbol.line.saturating_sub(1)) {
+            symbol.file = Some(location.file.clone());
+            symbol.line = location.line;
+        }
+    }
+    Ok(assembly)
+}
+
+/// Replace INCLUDE lines recursively while retaining each source location.
+fn expand_file(
+    path: &Path,
+    origin: &SourceLocation,
+    stack: &mut Vec<PathBuf>,
+    expanded: &mut ExpandedSource,
+) -> Result<(), Diagnostic> {
+    let canonical = fs::canonicalize(path).map_err(|error| Diagnostic {
+        file: Some(origin.file.clone()),
+        line: origin.line,
+        message: format!("cannot open '{}': {error}", path.display()),
+    })?;
+    if stack.contains(&canonical) {
+        return Err(Diagnostic {
+            file: Some(origin.file.clone()),
+            line: origin.line,
+            message: format!("include cycle involving '{}'", canonical.display()),
+        });
+    }
+    if stack.len() >= 32 {
+        return Err(Diagnostic {
+            file: Some(origin.file.clone()),
+            line: origin.line,
+            message: "include nesting exceeds 32 files".into(),
+        });
+    }
+    let source = fs::read_to_string(&canonical).map_err(|error| Diagnostic {
+        file: Some(origin.file.clone()),
+        line: origin.line,
+        message: format!("cannot read '{}': {error}", canonical.display()),
+    })?;
+    stack.push(canonical.clone());
+    for (index, raw) in source.lines().enumerate() {
+        let location = SourceLocation {
+            file: canonical.clone(),
+            line: index + 1,
+        };
+        let parsed = parse_line(raw);
+        if !expanded.ended && expanded.comment_depth == 0 {
+            if let Some(line) = parsed.as_ref().filter(|line| line.opcode == "INCLUDE") {
+                let Some(filename) = line
+                    .operand
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .filter(|value| !value.is_empty())
+                else {
+                    return Err(Diagnostic {
+                        file: Some(canonical),
+                        line: location.line,
+                        message: "INCLUDE needs a quoted filename".into(),
+                    });
+                };
+                if !line.label.is_empty() {
+                    expanded.text.push_str(line.label);
+                    expanded.text.push('\n');
+                    expanded.locations.push(location.clone());
+                }
+                let included = location.file.parent().unwrap().join(filename);
+                expand_file(&included, &location, stack, expanded)?;
+                continue;
+            }
+        }
+        expanded.text.push_str(raw);
+        expanded.text.push('\n');
+        expanded.locations.push(location);
+        if let Some(line) = parsed {
+            if !expanded.started {
+                if line.opcode == "ASS" {
+                    expanded.started = true;
+                }
+            } else if expanded.comment_depth > 0 {
+                if line.opcode == "BEC" {
+                    expanded.comment_depth += 1;
+                } else if line.opcode == "ENC" {
+                    expanded.comment_depth -= 1;
+                }
+            } else if line.opcode == "BEC" {
+                expanded.comment_depth = 1;
+            } else if line.opcode == "END" {
+                expanded.ended = true;
+            }
+        }
+    }
+    stack.pop();
+    Ok(())
+}
+
+/// Replace an expanded line number with its original file and line.
+fn map_location(diagnostic: &mut Diagnostic, locations: &[SourceLocation], root: &Path) {
+    if let Some(location) = locations.get(diagnostic.line.saturating_sub(1)) {
+        diagnostic.file = Some(location.file.clone());
+        diagnostic.line = location.line;
+    } else {
+        diagnostic.file = Some(root.to_path_buf());
+    }
+}
+
 /// Split a source line into optional label, opcode, and operand.
 fn parse_line(raw: &str) -> Option<SourceLine<'_>> {
     if raw.starts_with('*') {
@@ -537,10 +700,10 @@ fn parse_line(raw: &str) -> Option<SourceLine<'_>> {
     if raw.trim().is_empty() {
         return None;
     }
-    let has_label = !raw.starts_with(char::is_whitespace);
     let trimmed = raw.trim_start();
     let first_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
     let first = &trimmed[..first_end];
+    let has_label = !raw.starts_with(char::is_whitespace) && !first.eq_ignore_ascii_case("INCLUDE");
     let rest = trimmed[first_end..].trim_start();
     if has_label {
         let second_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
@@ -887,6 +1050,9 @@ impl<'a> Expression<'a> {
             }
             return Ok(Some(byte as i64));
         }
+        if ch == b'%' && self.text.get(self.pos + 1) == Some(&b'"') {
+            return self.visual_byte();
+        }
         let base = match ch {
             b'$' => Some(16),
             b'&' => Some(8),
@@ -902,6 +1068,17 @@ impl<'a> Expression<'a> {
                 return self.number(8, self.pos);
             }
             return self.number(base, start);
+        }
+        if ch == b'0' {
+            let base = match self.text.get(self.pos + 1) {
+                Some(b'b' | b'B') => Some(2),
+                Some(b'x' | b'X') => Some(16),
+                _ => None,
+            };
+            if let Some(base) = base {
+                self.pos += 2;
+                return self.number(base, self.pos);
+            }
         }
         if ch.is_ascii_digit() {
             return self.number(10, self.pos);
@@ -922,6 +1099,34 @@ impl<'a> Expression<'a> {
             }));
         }
         Err("illegal character in expression".into())
+    }
+
+    /// Parse an eight-pixel row with dots for zero bits and hashes for one bits.
+    fn visual_byte(&mut self) -> Result<Option<i64>, String> {
+        self.pos += 2;
+        let mut value = 0i64;
+        let mut digits = 0;
+        while let Some(&ch) = self.text.get(self.pos) {
+            self.pos += 1;
+            if ch == b'"' {
+                return if digits == 8 {
+                    Ok(Some(value))
+                } else {
+                    Err("visual binary literal needs exactly 8 pixels".into())
+                };
+            }
+            if digits == 8 {
+                return Err("visual binary literal needs exactly 8 pixels".into());
+            }
+            value = (value << 1)
+                | match ch {
+                    b'.' => 0,
+                    b'#' => 1,
+                    _ => return Err("visual binary literal accepts only '.' and '#'".into()),
+                };
+            digits += 1;
+        }
+        Err("unterminated visual binary literal".into())
     }
 
     /// Parse digits of a specific radix.
@@ -1173,6 +1378,13 @@ fn instruction_text(bytes: &[u8], address: usize) -> (String, usize) {
 mod tests {
     use super::*;
 
+    /// Return a source fixture in the include test directory.
+    fn include_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/include")
+            .join(name)
+    }
+
     /// Assemble a representative program with forward, backward, and local labels.
     #[test]
     fn program_and_directives() {
@@ -1262,6 +1474,112 @@ mod tests {
         assert_eq!(
             bytes,
             [0xa9, 0x22, 0xa9, 0x41, 0xa9, 0x41, 0xa9, 0x3b, 0xa9, 0x27, 0x2c, 0x22]
+        );
+    }
+
+    /// Accept conventional binary notation for byte data and immediates.
+    #[test]
+    fn binary_bytes_for_character_roms() {
+        let source =
+            "\tASS 0\n\tBYT 0b00111100,0B01000010,0b10000001,%11111111\n\tLDA #0b01000001\n\tEND\n";
+        assert_eq!(
+            assemble(source).unwrap().bytes,
+            [0x3c, 0x42, 0x81, 0xff, 0xa9, 0x41]
+        );
+        assert!(assemble("\tASS 0\n\tBYT 0b102\n\tEND\n").is_err());
+    }
+
+    /// Accept conventional hexadecimal notation throughout source expressions.
+    #[test]
+    fn hexadecimal_0x_literals() {
+        let source = "\tASS 0x1000\n\tBYT 0xaa,0XFF,$0a\n\tLDA #0x42\n\tADR 0x1234\n\tEND\n";
+        let assembly = assemble(source).unwrap();
+        assert_eq!(assembly.base, 0x1000);
+        assert_eq!(assembly.bytes, [0xaa, 0xff, 0x0a, 0xa9, 0x42, 0x34, 0x12]);
+        assert!(assemble("\tASS 0\n\tBYT 0x\n\tEND\n").is_err());
+        assert!(assemble("\tASS 0\n\tBYT 0xgg\n\tEND\n").is_err());
+    }
+
+    /// Assemble character rows written as visible pixels.
+    #[test]
+    fn visual_binary_bytes() {
+        let source = "\tASS 0\n\tBYT %\"..###...\",%\"#......#\",%\"########\",%\"........\"\n\tLDA #%\"...##...\"\n\tEND\n";
+        assert_eq!(
+            assemble(source).unwrap().bytes,
+            [0x38, 0x81, 0xff, 0x00, 0xa9, 0x18]
+        );
+        for value in [
+            "%\"..###..\"",
+            "%\"..###....\"",
+            "%\"..##X...\"",
+            "%\"..###...",
+        ] {
+            let source = format!("\tASS 0\n\tBYT {value}\n\tEND\n");
+            assert!(assemble(&source).is_err(), "accepted {value}");
+        }
+    }
+
+    /// Included lines share the caller's labels, program counter, and local scope.
+    #[test]
+    fn nested_includes_act_like_inserted_lines() {
+        let assembly = assemble_file(&include_fixture("main.asm")).unwrap();
+        let inserted = "\tASS $1000\nmain BNE .done\n\tBYT %\"..###...\"\n\tNOP\n.done RTS\n\tJMP routine\nroutine LDA #$7f\n\tRTS\n\tEND\n";
+        assert_eq!(assembly.bytes, assemble(inserted).unwrap().bytes);
+        assert_eq!(
+            assembly.bytes,
+            [0xd0, 2, 0x38, 0xea, 0x60, 0x4c, 8, 0x10, 0xa9, 0x7f, 0x60]
+        );
+        let routine = &assembly.symbols["routine"];
+        assert_eq!(routine.line, 2);
+        assert!(routine
+            .file
+            .as_ref()
+            .unwrap()
+            .ends_with("parts/routine.asm"));
+    }
+
+    /// Repeated includes are allowed, and an include can start in column one.
+    #[test]
+    fn include_same_file_twice() {
+        let assembly = assemble_file(&include_fixture("repeat.asm")).unwrap();
+        assert_eq!(assembly.bytes, [0xea, 0xea]);
+        assert_eq!(assembly.symbols["anchor"].value, 1);
+    }
+
+    /// Missing files and recursive cycles identify the original include line.
+    #[test]
+    fn include_errors_report_file_and_line() {
+        let missing = assemble_file(&include_fixture("missing.asm")).unwrap_err();
+        assert_eq!(missing[0].line, 3);
+        assert!(missing[0].file.as_ref().unwrap().ends_with("missing.asm"));
+        assert!(missing[0].message.contains("not_there.asm"));
+
+        let cycle = assemble_file(&include_fixture("cycle_a.asm")).unwrap_err();
+        assert_eq!(cycle[0].line, 2);
+        assert!(cycle[0].file.as_ref().unwrap().ends_with("cycle_b.asm"));
+        assert!(cycle[0].message.contains("include cycle"));
+
+        let bad = assemble_file(&include_fixture("bad.asm")).unwrap_err();
+        assert_eq!(bad[0].line, 2);
+        assert!(bad[0].file.as_ref().unwrap().ends_with("bad_body.asm"));
+        assert!(bad[0].message.contains("unknown opcode"));
+    }
+
+    /// Includes can introduce ASS, while commented and ended code is ignored.
+    #[test]
+    fn include_respects_assembly_control_directives() {
+        let bootstrap = assemble_file(&include_fixture("bootstrap.asm")).unwrap();
+        assert_eq!(bootstrap.base, 0x2000);
+        assert_eq!(bootstrap.bytes, [0x5a]);
+        assert!(assemble_file(&include_fixture("skip.asm"))
+            .unwrap()
+            .bytes
+            .is_empty());
+        assert_eq!(
+            assemble_file(&include_fixture("early_end.asm"))
+                .unwrap()
+                .bytes,
+            [0x33]
         );
     }
 }
