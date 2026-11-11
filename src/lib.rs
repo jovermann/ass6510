@@ -201,7 +201,7 @@ impl Assembler {
         }
     }
 
-    /// Remove the old local scope and report references it could not resolve.
+    /// Remove the previous local scope and report unresolved references.
     fn clear_locals(&mut self) {
         let mut remaining = Vec::new();
         for fixup in std::mem::take(&mut self.fixups) {
@@ -753,7 +753,7 @@ fn unquoted_delimiters(text: &str, delimiter: char) -> Vec<usize> {
     indices
 }
 
-/// Check the legacy symbol alphabet.
+/// Check whether a name uses valid symbol characters.
 fn valid_symbol(name: &str) -> bool {
     !name.is_empty()
         && name.len() < 120
@@ -974,7 +974,7 @@ fn opcode(name: &str, mode: Mode) -> Option<u8> {
     delta.map(|delta| base + delta)
 }
 
-/// Expression parser matching the original assembler's right-recursive evaluation.
+/// Expression parser with right-recursive binary evaluation.
 struct Expression<'a> {
     /// Original expression bytes.
     text: &'a [u8],
@@ -1188,7 +1188,7 @@ fn decode(byte: u8) -> Option<(&'static str, Mode)> {
     None
 }
 
-/// Return an opcode listing similar to the original utility's option.
+/// Format a listing of supported opcodes.
 pub fn opcode_list() -> String {
     let mut out = String::new();
     for byte in 0..=255u8 {
@@ -1466,7 +1466,7 @@ mod tests {
         }
     }
 
-    /// Accept legacy and closed character literals, including punctuation.
+    /// Accept open and closed character literals, including punctuation.
     #[test]
     fn character_immediates_and_list_items() {
         let source = "\tASS 0\n\tLDA #'\"' ; quote\n\tLDA #'A'\n\tLDA #'A\n\tLDA #';' ; semicolon\n\tLDA #''' ; apostrophe\n\tBYT ',', '\"'\n\tEND\n";

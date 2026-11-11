@@ -116,7 +116,7 @@ fn option_value(args: &[String], index: &mut usize, option: &str) -> Result<Stri
         .ok_or_else(|| format!("{option} needs a value"))
 }
 
-/// Parse options, recognizing the legacy short and long names.
+/// Parse the supported short and long options.
 fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
     let mut options = Options::default();
     let mut index = 1;
